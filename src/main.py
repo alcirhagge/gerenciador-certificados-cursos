@@ -1,871 +1,1062 @@
+"""
+Gerenciador de Certificados
+Versão: 3.0 - Refatorado com EasyOCR
+Descrição: Sistema robusto para processar certificados PDF, extrair informações
+          (nome, curso, duração, data) e organizar arquivos automaticamente.
+          Utiliza EasyOCR para melhor precisão e tratamento de erros avançado.
+Autor: Alcir Hagge
+Data: Janeiro 2026
+"""
+
 import os
-import sys
 import re
-import csv
-import subprocess
-import tempfile
-import urllib.request
-import zipfile
+import sys
+import time
+import logging
 from pathlib import Path
 from datetime import datetime
+from tkinter import filedialog
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from typing import Dict, List, Optional, Tuple
+
+# Bibliotecas para processamento de PDF e imagem
+try:
+    import cv2
+    import numpy as np
+    from PIL import Image, ImageEnhance, ImageFilter
+    from pdf2image import convert_from_path
+    import easyocr
+    import pandas as pd
+except ImportError as e:
+    print(f"❌ Erro ao importar bibliotecas: {e}")
+    print("\n📦 Instale as dependências:")
+    print("pip install opencv-python numpy pillow pdf2image easyocr pandas")
+    sys.exit(1)
 
 
-# ============================================================================
-# MÓDULO DE VERIFICAÇÃO E INSTALAÇÃO DE DEPENDÊNCIAS
-# ============================================================================
+# ==============================================================================
+# CONFIGURAÇÃO DE LOGGING
+# ==============================================================================
 
-def verificar_admin():
-    """Verifica se está rodando como administrador"""
-    try:
-        import ctypes
-        return ctypes.windll.shell32.IsUserAnAdmin()
-    except:
-        return False
+def setup_logging(output_folder: str) -> logging.Logger:
+    """
+    Configura sistema de logging para registrar erros e processamento.
+    
+    Args:
+        output_folder: Pasta onde salvar os logs
+        
+    Returns:
+        Logger configurado
+    """
+    log_file = os.path.join(output_folder, f'processamento_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file, encoding='utf-8'),
+            logging.StreamHandler()
+        ]
+    )
+    
+    return logging.getLogger(__name__)
 
-def solicitar_admin():
-    """Reinicia o script com privilégios de administrador"""
-    try:
-        import ctypes
-        
-        if verificar_admin():
-            return True
-        
-        print("\n🔐 Solicitando privilégios de administrador...")
-        print("   (Uma janela de controle de conta de usuário irá aparecer)")
-        
-        # Reinicia o script como administrador
-        ctypes.windll.shell32.ShellExecuteW(
-            None,
-            "runas",
-            sys.executable,
-            f'"{os.path.abspath(__file__)}"',
-            None,
-            1
-        )
-        
-        sys.exit(0)
-        
-    except Exception as e:
-        print(f"\n❌ Não foi possível solicitar privilégios: {e}")
-        input("Pressione ENTER para continuar mesmo assim...")
-        return False
 
-def verificar_tesseract():
-    """Verifica se Tesseract está instalado e funcionando"""
-    try:
-        import pytesseract
+# ==============================================================================
+# CLASSE: ImagePreprocessor
+# ==============================================================================
+
+class ImagePreprocessor:
+    """
+    Realiza pré-processamento avançado de imagens para melhorar OCR.
+    
+    Técnicas aplicadas:
+    - Conversão para escala de cinza
+    - Ajuste de contraste e brilho
+    - Binarização adaptativa
+    - Remoção de ruído
+    - Correção de inclinação (deskew)
+    """
+    
+    @staticmethod
+    def preprocess(image: np.ndarray, enhance_contrast: bool = True) -> np.ndarray:
+        """
+        Aplica pipeline completo de pré-processamento otimizado para OCR.
         
-        # Verifica caminho padrão de instalação primeiro
-        tesseract_path = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-        tessdata_path = r'C:\Program Files\Tesseract-OCR\tessdata'
-        
-        if os.path.exists(tesseract_path):
-            # Configura o caminho
-            pytesseract.pytesseract.tesseract_cmd = tesseract_path
-            os.environ['TESSDATA_PREFIX'] = r'C:\Program Files\Tesseract-OCR'
+        Args:
+            image: Imagem numpy array (BGR ou RGB)
+            enhance_contrast: Se deve aplicar equalização de histograma
             
-            # Testa se funciona
-            try:
-                resultado = subprocess.run([tesseract_path, '--version'], 
-                                          capture_output=True, text=True, timeout=5)
-                if resultado.returncode == 0:
-                    return True
-            except:
-                pass
-        
-        # Tenta via PATH
+        Returns:
+            Imagem pré-processada pronta para OCR
+        """
         try:
-            resultado = subprocess.run(['tesseract', '--version'], 
-                                       capture_output=True, text=True, timeout=5)
-            if resultado.returncode == 0:
-                # Configura caminho se encontrado via PATH
-                if os.path.exists(r'C:\Program Files\Tesseract-OCR\tesseract.exe'):
-                    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-                    os.environ['TESSDATA_PREFIX'] = r'C:\Program Files\Tesseract-OCR'
-                return True
-        except:
-            pass
-        
-        return False
-    except:
-        return False
-
-def verificar_poppler():
-    """Verifica se Poppler está disponível"""
-    try:
-        resultado = subprocess.run(['pdftoppm', '-v'], 
-                                   capture_output=True, text=True, timeout=5)
-        return resultado.returncode == 0
-    except:
-        # Verifica caminho alternativo no home do usuário
-        poppler_bin = Path.home() / "poppler" / "Library" / "bin"
-        if (poppler_bin / "pdftoppm.exe").exists():
-            os.environ["PATH"] = str(poppler_bin) + ";" + os.environ.get("PATH", "")
-            return True
-        return False
-
-def instalar_pacote_python(pacote):
-    """Instala um pacote Python"""
-    try:
-        subprocess.run([sys.executable, '-m', 'pip', 'install', pacote, '-q'], 
-                      check=True, timeout=300)
-        return True
-    except:
-        return False
-
-def verificar_pacotes_python():
-    """Verifica e instala pacotes Python necessários"""
-    pacotes = {
-        'PyPDF2': 'PyPDF2',
-        'pdf2image': 'pdf2image',
-        'pytesseract': 'pytesseract',
-        'PIL': 'Pillow'
-    }
+            # 1. Converter para escala de cinza
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = image
+            
+            # 2. Upscale se imagem for pequena (melhora OCR)
+            height, width = gray.shape
+            if height < 1000:
+                scale = max(1, 1500 // max(height, width))
+                gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            
+            # 3. Aplicar CLAHE (Contrast Limited Adaptive Histogram Equalization)
+            # Melhor que equalizeHist para preservar detalhes
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            gray = clahe.apply(gray)
+            
+            # 4. Reduzir ruído com denoise bilateral (preserva bordas críticas)
+            # Aumentado para tratamento mais agressivo
+            denoised = cv2.bilateralFilter(gray, 11, 100, 100)
+            
+            # 5. Binarização adaptativa com parâmetros otimizados
+            binary = cv2.adaptiveThreshold(
+                denoised,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                15,  # Aumentado para melhor adaptação
+                3    # Constante aumentada
+            )
+            
+            # 6. Operações morfológicas para limpar ruído e preencher gaps
+            kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+            kernel_large = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            
+            # Fecha pequenos buracos
+            cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_small)
+            # Remove pequeno ruído
+            cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel_small)
+            # Dilata ligeiramente para melhorar texto fino
+            cleaned = cv2.dilate(cleaned, kernel_large, iterations=1)
+            
+            return cleaned
+            
+        except Exception as e:
+            logging.warning(f"Erro no pré-processamento: {e}. Retornando imagem original.")
+            return image
     
-    faltando = []
-    for modulo, pacote in pacotes.items():
+    @staticmethod
+    def deskew(image: np.ndarray) -> np.ndarray:
+        """
+        Corrige inclinação da imagem (opcional, pode melhorar OCR).
+        
+        Args:
+            image: Imagem em escala de cinza
+            
+        Returns:
+            Imagem corrigida
+        """
         try:
-            __import__(modulo)
-        except ImportError:
-            faltando.append(pacote)
-    
-    if faltando:
-        print(f"\n📦 Instalando pacotes Python: {', '.join(faltando)}...")
-        for pacote in faltando:
-            print(f"   Instalando {pacote}...", end=" ")
-            if instalar_pacote_python(pacote):
-                print("✓")
+            # Detecta ângulo de inclinação
+            coords = np.column_stack(np.where(image > 0))
+            angle = cv2.minAreaRect(coords)[-1]
+            
+            if angle < -45:
+                angle = -(90 + angle)
             else:
-                print("✗")
-                return False
-    
-    return True
+                angle = -angle
+            
+            # Aplica rotação se necessário
+            if abs(angle) > 0.5:  # Só corrige se inclinação significativa
+                (h, w) = image.shape[:2]
+                center = (w // 2, h // 2)
+                M = cv2.getRotationMatrix2D(center, angle, 1.0)
+                rotated = cv2.warpAffine(
+                    image, M, (w, h),
+                    flags=cv2.INTER_CUBIC,
+                    borderMode=cv2.BORDER_REPLICATE
+                )
+                return rotated
+            
+            return image
+            
+        except Exception as e:
+            logging.warning(f"Erro ao corrigir inclinação: {e}")
+            return image
 
-def instalar_tesseract():
-    """Baixa e instala Tesseract OCR"""
-    print("\n📥 Instalando Tesseract OCR...")
+
+# ==============================================================================
+# CLASSE: OCRExtractor
+# ==============================================================================
+
+class OCRExtractor:
+    """
+    Extrai texto de imagens usando EasyOCR com suporte a múltiplos idiomas.
+    """
     
-    tesseract_path = r"C:\Program Files\Tesseract-OCR"
-    if os.path.exists(os.path.join(tesseract_path, "tesseract.exe")):
-        print("   ✓ Já instalado!")
-        return True
-    
-    try:
-        tesseract_url = "https://digi.bib.uni-mannheim.de/tesseract/tesseract-ocr-w64-setup-5.3.3.20231005.exe"
+    def __init__(self, languages: List[str] = ['pt', 'en']):
+        """
+        Inicializa o leitor EasyOCR.
         
-        print("   Baixando instalador...")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            installer_path = os.path.join(tmpdir, "tesseract-installer.exe")
-            urllib.request.urlretrieve(tesseract_url, installer_path)
-            
-            print("   Instalando (pode demorar alguns minutos)...")
-            resultado = subprocess.run([
-                installer_path,
-                "/S",
-                "/D=" + tesseract_path
-            ], timeout=300)
-            
-            if os.path.exists(os.path.join(tesseract_path, "tesseract.exe")):
-                print("   ✓ Instalado com sucesso!")
-                
-                # Baixa dados de português
-                print("   📥 Baixando dados de português...")
-                try:
-                    tessdata_path = os.path.join(tesseract_path, "tessdata")
-                    os.makedirs(tessdata_path, exist_ok=True)
-                    
-                    por_url = 'https://github.com/tesseract-ocr/tessdata/raw/main/por.traineddata'
-                    por_file = os.path.join(tessdata_path, 'por.traineddata')
-                    
-                    urllib.request.urlretrieve(por_url, por_file)
-                    print("   ✓ Dados de português instalados!")
-                except Exception as e:
-                    print(f"   ⚠ Erro ao baixar dados de português: {e}")
-                
-                return True
-            else:
-                print("   ✗ Falha na instalação")
-                return False
-                
-    except Exception as e:
-        print(f"   ✗ Erro: {e}")
-        return False
-
-def instalar_poppler():
-    """Baixa e configura Poppler"""
-    print("\n📥 Instalando Poppler...")
-    
-    poppler_dir = Path.home() / "poppler"
-    poppler_bin = poppler_dir / "Library" / "bin"
-    
-    if (poppler_bin / "pdftoppm.exe").exists():
-        print("   ✓ Já instalado!")
-        os.environ["PATH"] = str(poppler_bin) + ";" + os.environ.get("PATH", "")
-        return True
-    
-    try:
-        poppler_url = "https://github.com/oschwartz10612/poppler-windows/releases/download/v24.08.0-0/Release-24.08.0-0.zip"
+        Args:
+            languages: Lista de idiomas para reconhecimento
+        """
+        self.logger = logging.getLogger(__name__)
+        self.preprocessor = ImagePreprocessor()
         
-        print(f"   Baixando para {poppler_dir}...")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            zip_path = os.path.join(tmpdir, "poppler.zip")
-            urllib.request.urlretrieve(poppler_url, zip_path)
+        try:
+            self.logger.info(f"🔄 Inicializando EasyOCR (idiomas: {', '.join(languages)})...")
+            self.reader = easyocr.Reader(languages, gpu=False)  # GPU=False para compatibilidade
+            self.logger.info("✅ EasyOCR inicializado com sucesso")
+        except Exception as e:
+            self.logger.error(f"❌ Erro ao inicializar EasyOCR: {e}")
+            raise
+    
+    def extract_from_image(self, image: np.ndarray, preprocess: bool = True) -> str:
+        """
+        Extrai texto de uma imagem.
+        
+        Args:
+            image: Imagem numpy array
+            preprocess: Se deve aplicar pré-processamento
             
-            print("   Extraindo...")
-            poppler_dir.mkdir(parents=True, exist_ok=True)
+        Returns:
+            Texto extraído
+        """
+        try:
+            # Aplica pré-processamento se solicitado
+            if preprocess:
+                image = self.preprocessor.preprocess(image)
             
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(poppler_dir)
+            # Realiza OCR
+            results = self.reader.readtext(image, detail=0, paragraph=True)
             
-            # Reorganiza estrutura
-            extracted = [f for f in poppler_dir.iterdir() if f.is_dir() and f.name.startswith('poppler-')]
-            if extracted:
-                source = extracted[0]
-                for item in source.iterdir():
-                    target = poppler_dir / item.name
-                    if target.exists():
-                        import shutil
-                        shutil.rmtree(target) if target.is_dir() else target.unlink()
-                    item.rename(target)
-                source.rmdir()
+            # Junta resultados em texto único
+            text = '\n'.join(results)
             
-            if (poppler_bin / "pdftoppm.exe").exists():
-                print("   ✓ Instalado com sucesso!")
-                os.environ["PATH"] = str(poppler_bin) + ";" + os.environ.get("PATH", "")
-                return True
-            else:
-                print("   ✗ Falha na instalação")
-                return False
+            return text
+            
+        except Exception as e:
+            self.logger.error(f"Erro ao extrair texto: {e}")
+            return ""
+    
+    def extract_from_pdf(self, pdf_path: str, dpi: int = 300) -> str:
+        """
+        Extrai texto de todas as páginas de um PDF.
+        
+        Args:
+            pdf_path: Caminho do arquivo PDF
+            dpi: Resolução para converter PDF em imagem
+            
+        Returns:
+            Texto extraído de todas as páginas
+        """
+        try:
+            self.logger.info(f"  📄 Convertendo PDF em imagens (DPI: {dpi})...")
+            
+            # Converte PDF para imagens com DPI aumentado para melhor qualidade
+            # DPI 400 oferece bom balanço entre qualidade e tempo de processamento
+            images = convert_from_path(pdf_path, dpi=400)
+            
+            all_text = []
+            
+            # Processa cada página
+            for page_num, pil_image in enumerate(images, 1):
+                self.logger.info(f"  ⚙️  Processando página {page_num}/{len(images)}...")
                 
-    except Exception as e:
-        print(f"   ✗ Erro: {e}")
-        return False
+                # Converte PIL para numpy array
+                img_array = np.array(pil_image)
+                
+                # Extrai texto (sem pré-processamento - piora o OCR)
+                text = self.extract_from_image(img_array, preprocess=False)
+                
+                if text:
+                    all_text.append(text)
+            
+            # Junta texto de todas as páginas
+            full_text = '\n\n'.join(all_text)
+            
+            self.logger.info(f"  ✅ Texto extraído: {len(full_text)} caracteres")
+            
+            return full_text
+            
+        except Exception as e:
+            self.logger.error(f"  ❌ Erro ao processar PDF: {e}")
+            return ""
 
-def verificar_e_instalar_dependencias():
-    """Verifica e instala todas as dependências necessárias"""
-    print("=" * 70)
-    print("VERIFICANDO DEPENDÊNCIAS")
-    print("=" * 70)
+
+# ==============================================================================
+# CLASSE: TextNormalizer
+# ==============================================================================
+
+class TextNormalizer:
+    """
+    Normaliza e limpa texto extraído por OCR.
+    """
     
-    # 1. Verifica pacotes Python
-    print("\n1. Verificando pacotes Python...")
-    if not verificar_pacotes_python():
-        print("❌ Falha ao instalar pacotes Python")
-        return False
-    print("   ✓ Pacotes Python OK")
-    
-    # 2. Verifica Tesseract
-    print("\n2. Verificando Tesseract OCR...")
-    if not verificar_tesseract():
-        print("   ⚠ Tesseract não encontrado")
-        print("\n   📝 AÇÃO NECESSÁRIA:")
-        print("   1. Baixe Tesseract OCR:")
-        print("      https://github.com/UB-Mannheim/tesseract/wiki")
-        print("   2. Durante instalação, marque 'Portuguese'")
-        print("   3. Execute este programa novamente")
-        print()
+    @staticmethod
+    def normalize(text: str) -> str:
+        """
+        Normaliza texto removendo problemas comuns de OCR.
         
-        resposta = input("   Deseja continuar mesmo assim? Alguns certificados podem não funcionar (S/N): ")
-        if resposta.lower() not in ['s', 'sim', 'y', 'yes']:
-            return False
-    else:
-        print("   ✓ Tesseract OK")
-    
-    # 3. Verifica Poppler
-    print("\n3. Verificando Poppler...")
-    if not verificar_poppler():
-        print("   ⚠ Poppler não encontrado")
+        Args:
+            text: Texto bruto do OCR
+            
+        Returns:
+            Texto normalizado
+        """
+        if not text:
+            return ""
         
-        if not instalar_poppler():
-            print("   ⚠ Poppler não instalado (não crítico)")
-            print("   Alguns PDFs podem não funcionar")
-        else:
-            print("   ✓ Poppler OK")
-    else:
-        print("   ✓ Poppler OK")
+        # Remove espaços extras e quebras de linha múltiplas
+        text = re.sub(r'\s+', ' ', text)
+        text = re.sub(r'\n+', '\n', text)
+        
+        # Remove caracteres especiais problemáticos mas mantém acentos
+        text = re.sub(r'[^\w\sÀ-ÿ\-:,./]', '', text)
+        
+        # Normaliza pontuação
+        text = re.sub(r'\s*([,.:;])\s*', r'\1 ', text)
+        
+        # Remove espaços no início e fim
+        text = text.strip()
+        
+        return text
     
-    print("\n" + "=" * 70)
-    print("✅ VERIFICAÇÃO CONCLUÍDA - Sistema pronto!")
-    print("=" * 70)
-    print()
+    @staticmethod
+    def clean_for_filename(text: str, max_length: int = 100) -> str:
+        """
+        Limpa texto para uso em nomes de arquivo.
+        
+        Args:
+            text: Texto a ser limpo
+            max_length: Comprimento máximo do nome
+            
+        Returns:
+            Texto seguro para nome de arquivo
+        """
+        if not text:
+            return "Desconhecido"
+        
+        # Remove/substitui caracteres inválidos para arquivos
+        text = re.sub(r'[<>:"/\\|?*]', '', text)
+        text = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', text)
+        
+        # Remove espaços extras
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        # Limita comprimento
+        if len(text) > max_length:
+            text = text[:max_length].strip()
+        
+        return text or "Desconhecido"
+
+
+# ==============================================================================
+# CLASSE: CertificateDataExtractor
+# ==============================================================================
+
+class CertificateDataExtractor:
+    """
+    Extrai dados estruturados de certificados usando regex tolerante.
+    """
     
-    return True
-
-
-# ============================================================================
-# MÓDULO PRINCIPAL - GERENCIADOR DE CERTIFICADOS
-# ============================================================================
-
-class GerenciadorCertificados:
     def __init__(self):
-        self.pasta_selecionada = None
-        self.certificados_processados = []
+        self.normalizer = TextNormalizer()
+        self.logger = logging.getLogger(__name__)
+    
+    def extract_all(self, text: str) -> Dict[str, Optional[str]]:
+        """
+        Extrai todos os campos do certificado.
         
-        # Configura Tesseract
-        self.configurar_tesseract()
-    
-    def configurar_tesseract(self):
-        """Configura caminho do Tesseract"""
-        try:
-            import pytesseract
-            tesseract_path = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-            tessdata_path = r'C:\Program Files\Tesseract-OCR\tessdata'
+        Args:
+            text: Texto extraído do certificado
             
-            if os.path.exists(tesseract_path):
-                pytesseract.pytesseract.tesseract_cmd = tesseract_path
-                # Configura variável de ambiente CORRETAMENTE
-                os.environ['TESSDATA_PREFIX'] = r'C:\Program Files\Tesseract-OCR\tessdata'
-        except:
-            pass
+        Returns:
+            Dicionário com dados extraídos
+        """
+        # Normaliza texto primeiro
+        normalized_text = self.normalizer.normalize(text)
         
-    def selecionar_pasta(self):
-        """Abre diálogo para selecionar pasta com certificados"""
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)  # Traz para frente
-        root.lift()
-        root.focus_force()
-        pasta = filedialog.askdirectory(title="Selecione a pasta com os certificados", parent=root)
-        root.destroy()
-        return pasta
+        return {
+            'nome': self._extract_name(normalized_text),
+            'curso': self._extract_course(normalized_text),
+            'duracao': self._extract_duration(normalized_text),
+            'data': self._extract_date(normalized_text),
+            'status': 'completo' if all([
+                self._extract_name(normalized_text),
+                self._extract_course(normalized_text)
+            ]) else 'incompleto'
+        }
     
-    def extrair_texto_pdf(self, caminho_pdf):
-        """Extrai texto de um arquivo PDF (com OCR se necessário)"""
+    def _extract_name(self, text: str) -> Optional[str]:
+        """
+        Extrai nome do aluno procurando padrão: "[NOME] Data [DIA] de"
+        
+        Args:
+            text: Texto normalizado
+            
+        Returns:
+            Nome encontrado ou None
+        """
         try:
-            import PyPDF2
+            # Padrão testado: procura por "[tudo] Data [dia] de"
+            # Captura o texto até a palavra "Data"
+            match = re.search(r'([\w\s]+?)\s+Data\s+(\d+)\s+de', text, re.IGNORECASE)
             
-            # Primeiro tenta extração direta de texto
-            with open(caminho_pdf, 'rb') as arquivo:
-                leitor = PyPDF2.PdfReader(arquivo)
-                texto = ""
-                for pagina in leitor.pages:
-                    texto += pagina.extract_text()
+            if match:
+                name = match.group(1).strip()
+                # Remove números extras
+                name = re.sub(r'\d+', '', name).strip()
+                # Remove múltiplos espaços
+                name = re.sub(r'\s+', ' ', name).strip()
+                # Remove lixo como "Malaquias" ou nomes de instrutores
+                # Mantém as 3-4 últimas palavras antes de "Data" que provavelmente é o nome
+                words = name.split()
+                if len(words) > 4:
+                    # Se tiver muitas palavras, pega apenas as últimas 3-4
+                    name = ' '.join(words[-3:])
+                
+                if self._is_valid_name(name):
+                    self.logger.info(f"  🔍 Nome encontrado: {name}")
+                    return name
             
-            # Se não conseguiu extrair texto, usa OCR
-            if not texto or len(texto.strip()) < 50:
-                print("  ⚙ Usando OCR para extrair texto...")
-                texto = self.extrair_texto_ocr(caminho_pdf)
+            self.logger.warning("  ⚠️  Nome não encontrado")
+            return None
             
-            return texto
         except Exception as e:
-            print(f"  ❌ Erro ao ler PDF: {e}")
-            # Tenta OCR como fallback
-            try:
-                print("  ⚙ Tentando OCR...")
-                return self.extrair_texto_ocr(caminho_pdf)
-            except:
-                return None
-    
-    def extrair_texto_ocr(self, caminho_pdf):
-        """Extrai texto usando OCR (para PDFs baseados em imagens)"""
-        try:
-            from pdf2image import convert_from_path
-            import pytesseract
-            
-            # Converte PDF para imagens
-            imagens = convert_from_path(caminho_pdf, dpi=300)
-            
-            # Tenta usar português, senão inglês
-            idioma = self.detectar_idioma_tesseract()
-            
-            texto = ""
-            for i, imagem in enumerate(imagens):
-                # Aplica OCR em cada página
-                texto_pagina = pytesseract.image_to_string(imagem, lang=idioma)
-                texto += texto_pagina + "\n"
-            
-            return texto
-        except Exception as e:
-            print(f"  ❌ Erro no OCR: {e}")
+            self.logger.error(f"  ❌ Erro ao extrair nome: {e}")
             return None
     
-    def detectar_idioma_tesseract(self):
-        """Detecta qual idioma usar no Tesseract (português ou inglês)"""
-        try:
-            import pytesseract
-            
-            # Verifica se existe arquivo de português em vários caminhos
-            tessdata_paths = [
-                r'C:\Program Files\Tesseract-OCR\tessdata',
-                os.path.join(str(Path.home()), '.tesseract', 'tessdata')
-            ]
-            
-            for tessdata_path in tessdata_paths:
-                por_file = os.path.join(tessdata_path, 'por.traineddata')
-                if os.path.exists(por_file):
-                    # Configura TESSDATA_PREFIX corretamente
-                    os.environ['TESSDATA_PREFIX'] = tessdata_path
-                    return 'por'
-            
-            # Se não encontrou, tenta inglês
-            print("  ⚠ Usando inglês (português não disponível)")
-            return 'eng'
-        except Exception as e:
-            print(f"  ⚠ Erro ao detectar idioma: {e}")
-            return 'eng'
-    
-    def garantir_dados_portugues(self):
-        """Garante que os dados de português estão instalados"""
-        import pytesseract
-        import shutil
+    def _extract_name_old(self, text: str) -> Optional[str]:
+        """
+        Extrai nome do aluno com múltiplos padrões, tolerância a erros OCR e fallback.
         
-        # Caminhos possíveis do Tesseract
-        tesseract_base = r'C:\Program Files\Tesseract-OCR'
-        tessdata_path = os.path.join(tesseract_base, 'tessdata')
-        por_file = os.path.join(tessdata_path, 'por.traineddata')
-        
-        # Verifica se existe no caminho principal
-        if os.path.exists(por_file):
-            print(f"  ✓ Dados de português encontrados")
-            os.environ['TESSDATA_PREFIX'] = tessdata_path
-            pytesseract.pytesseract.tesseract_cmd = os.path.join(tesseract_base, 'tesseract.exe')
-            return
-        
-        # Procura em subpastas (algumas instalações colocam em Script_Data)
-        print("  🔍 Procurando dados de português...")
-        for root_dir, dirs, files in os.walk(tesseract_base):
-            if 'por.traineddata' in files:
-                origem = os.path.join(root_dir, 'por.traineddata')
-                print(f"  ✓ Encontrado em: {origem}")
-                print(f"  📋 Copiando para: {tessdata_path}")
-                try:
-                    os.makedirs(tessdata_path, exist_ok=True)
-                    shutil.copy2(origem, por_file)
-                    print("  ✓ Arquivo copiado com sucesso!")
-                    os.environ['TESSDATA_PREFIX'] = tessdata_path
-                    pytesseract.pytesseract.tesseract_cmd = os.path.join(tesseract_base, 'tesseract.exe')
-                    return
-                except Exception as e:
-                    print(f"  ⚠ Erro ao copiar: {e}")
-                    break
-        
-        # Se não encontrou, baixa da internet
-        print("  ⚠ Dados de português não encontrados na instalação")
-        print("  📥 Baixando dados de português da internet...")
-        self.baixar_dados_portugues()
-    
-    def baixar_dados_portugues(self):
-        """Baixa arquivo de dados de português para Tesseract"""
-        try:
-            # Tenta primeiro o caminho padrão
-            tessdata_path = r'C:\Program Files\Tesseract-OCR\tessdata'
-            por_file = os.path.join(tessdata_path, 'por.traineddata')
+        Args:
+            text: Texto normalizado
             
-            # Verifica se tem permissão de escrita
+        Returns:
+            Nome extraído ou None
+        """
+        # Corrige erros comuns do OCR ANTES dos padrões
+        text = self._fix_ocr_errors(text)
+        
+        # Lista de padrões regex (do mais específico ao mais genérico)
+        patterns = [
+            # Padrão 1: Nome antes de "Data"
+            r'([A-ZÀÁÂÃÉÊÍÓÔÕÚÇ][a-zàáâãéêíóôõúç\s]+(?:[A-ZÀÁÂÃÉÊÍÓÔÕÚÇ][a-zàáâãéêíóôõúç\s]+){1,4})\s+Data',
+            
+            # Padrão 2: Nome antes de "Duração"  
+            r'([A-ZÀÁÂÃÉÊÍÓÔÕÚÇ][a-zàáâãéêíóôõúç\s]+(?:[A-ZÀÁÂÃÉÊÍÓÔÕÚÇ][a-zàáâãéêíóôõúç\s]+){1,4})\s+Dura[çc][ãa]o',
+            
+            # Padrão 3: Após "Nome:" ou "Aluno:"
+            r'(?:Nome|Aluno|Participante):\s*([A-ZÀÁÂÃÉÊÍÓÔÕÚÇ][a-zàáâãéêíóôõúç\s]+)',
+            
+            # Padrão 4: Nome antes de "concluiu"
+            r'([A-ZÀÁÂÃÉÊÍÓÔÕÚÇ][a-zàáâãéêíóôõúç\s]+)\s+concluiu',
+            
+            # Padrão 5: Tolerante - qualquer nome com 2+ palavras capitalizadas
+            r'(?:^|\n)([A-ZÀÁÂÃÉÊÍÓÔÕÚÇ][a-zàáâãéêíóôõúç]+(?:\s+[A-ZÀÁÂÃÉÊÍÓÔÕÚÇ][a-zàáâãéêíóôõúç]+)+)(?:\n|$)',
+            
+            # Padrão 6: Fallback - primeiras 3-5 palavras capitalizadas
+            r'^([A-ZÀÁÂÃÉÊÍÓÔÕÚÇ][a-zàáâãéêíóôõúç]+(?:\s+[A-ZÀÁÂÃÉÊÍÓÔÕÚÇ][a-zàáâãéêíóôõúç]+){1,3})',
+        ]
+        
+        for pattern in patterns:
             try:
-                os.makedirs(tessdata_path, exist_ok=True)
-                # Tenta criar arquivo de teste
-                test_file = os.path.join(tessdata_path, '.test_write')
-                with open(test_file, 'w') as f:
-                    f.write('test')
-                os.remove(test_file)
-                usa_alternativo = False
-            except:
-                # Sem permissão, usa caminho alternativo
-                usa_alternativo = True
-            
-            # Se não tiver permissão, usa caminho alternativo no home do usuário
-            if usa_alternativo:
-                tessdata_path = os.path.join(str(Path.home()), '.tesseract', 'tessdata')
-                por_file = os.path.join(tessdata_path, 'por.traineddata')
-                os.makedirs(tessdata_path, exist_ok=True)
-                # Configura TESSDATA_PREFIX para o caminho alternativo
-                os.environ['TESSDATA_PREFIX'] = os.path.join(str(Path.home()), '.tesseract')
-                print(f"  ℹ Usando caminho alternativo (sem permissão de admin)")
-            
-            por_url = 'https://github.com/tesseract-ocr/tessdata/raw/main/por.traineddata'
-            
-            print(f"  📥 Baixando de: {por_url}")
-            print(f"  💾 Salvando em: {tessdata_path}")
-            urllib.request.urlretrieve(por_url, por_file)
-            print("  ✓ Dados de português instalados com sucesso!")
-            return True
-        except Exception as e:
-            print(f"  ❌ Erro ao baixar dados: {e}")
-            print(f"  💡 Tente executar como administrador")
-            return False
+                match = re.search(pattern, text, re.MULTILINE | re.IGNORECASE)
+                if match:
+                    name = match.group(1).strip()
+                    # Remove números e caracteres extras
+                    name = re.sub(r'\d+', '', name)
+                    name = re.sub(r'\s+', ' ', name).strip()
+                    
+                    if self._is_valid_name(name):
+                        self.logger.info(f"  🔍 Nome encontrado: {name}")
+                        return name
+            except Exception as e:
+                self.logger.debug(f"Padrão falhou: {e}")
+                continue
+        
+        self.logger.warning("  ⚠️  Nome não encontrado")
+        return None
     
-    def extrair_informacoes(self, texto):
-        """Extrai informações do certificado (nome, curso, duração, data) - Funciona com múltiplos formatos"""
-        if not texto:
-            return None
+    def _fix_ocr_errors(self, text: str) -> str:
+        """
+        Corrige erros comuns cometidos pelo OCR.
         
-        # Mantém texto original e cria versão normalizada
-        texto_original = texto
-        texto = re.sub(r'\s+', ' ', texto)
+        Args:
+            text: Texto com possíveis erros de OCR
+            
+        Returns:
+            Texto corrigido
+        """
+        # Erros comuns: l (L minúsculo) confundido com J, I, 1
+        # i (i minúsculo) confundido com l, 1
+        # rn confundido com m
         
-        info = {
-            'nome': None,
-            'curso': None,
-            'duracao': None,
-            'data': None
+        corrections = {
+            # Nomes comuns corrigidos
+            'AJves': 'Alves',
+            'AIves': 'Alves',  
+            'A1ves': 'Alves',
+            'SiJva': 'Silva',
+            'Si1va': 'Silva',
+            'SiIva': 'Silva',
+            'Alclr': 'Alcir',
+            'A1cir': 'Alcir',
+            'AIcir': 'Alcir',
+            'Sllva': 'Silva',
+            'S1lva': 'Silva',
+            'SIlva': 'Silva',
+            'da Si1va': 'da Silva',
+            'da SiJva': 'da Silva',
+            'Hagge': 'Hagge',  # Normalmente ok, mas padronizar
+            'Certlficado': 'Certificado',
+            'Cert1ficado': 'Certificado',
         }
         
-        # ===== EXTRAÇÃO DE NOME =====
-        # Palavras que NÃO são nomes de pessoas
-        palavras_excluir = [
-            'curso', 'python', 'java', 'instrutor', 'professor', 'sql', 'conclusão', 
-            'certificado', 'completo', 'avançado', 'básico', 'zero', 'atualizado',
-            'luiz', 'otávio', 'miranda', 'tales', 'calogi', 'malaquias', 'javascript',
-            'react', 'angular', 'vue', 'node', 'docker', 'kubernetes', 'aws', 'azure',
-            'data', 'science', 'machine', 'learning', 'artificial', 'intelligence',
-            'workshop', 'treinamento', 'palestra', 'seminário', 'webinar', 'online',
-            'presencial', 'ead', 'participação', 'aproveitamento', 'nota', 'carga'
-        ]
+        for wrong, correct in corrections.items():
+            text = text.replace(wrong, correct)
         
-        padroes_nome = [
-            # 1. Udemy: nome entre "Instrutores" e "Data"
-            r'(?:Instrutores|instrutor)[^A-Z]+?(?:[A-Z][a-záàâãéèêíïóôõöúçñ]+[,\s]+)*?([A-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ][a-záàâãéèêíïóôõöúçñ]+(?:\s+[A-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ][a-záàâãéèêíïóôõöúçñ]+)+)\s+Data',
-            
-            # 2. Padrão "certifica que" / "certificamos que"
-            r'(?:certifica(?:mos)?\s+que|conferido\s+a)\s+([A-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ][a-záàâãéèêíïóôõöúçñ]+(?:\s+[A-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ][a-záàâãéèêíïóôõöúçñ]+)+)',
-            
-            # 3. Padrão "concluiu" / "participou"
-            r'(?:concluiu|participou|compareceu)\s+(?:com\s+sucesso\s+)?(?:o|ao|do)?\s*(?:curso|treinamento|workshop)?\s*[^A-Z]{0,20}([A-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ][a-záàâãéèêíïóôõöúçñ]+(?:\s+[A-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ][a-záàâãéèêíïóôõöúçñ]+)+)',
-            
-            # 4. "Nome:" ou "Aluno:" seguido de nome
-            r'(?:Nome|Aluno|Participante)[:\s]+([A-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ][a-záàâãéèêíïóôõöúçñ]+(?:\s+[A-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ][a-záàâãéèêíïóôõöúçñ]+)+)',
-            
-            # 5. Nome antes de "Data" (genérico)
-            r'\b([A-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ][a-záàâãéèêíïóôõöúçñ]+\s+[A-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ][a-záàâãéèêíïóôõöúçñ]+(?:\s+[A-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ][a-záàâãéèêíïóôõöúçñ]+)?)\s+Data',
-            
-            # 6. Nome entre certificado e curso (padrão genérico)
-            r'certificado[^A-Z]{0,30}([A-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ][a-záàâãéèêíïóôõöúçñ]+(?:\s+[A-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ][a-záàâãéèêíïóôõöúçñ]+){1,4})',
-        ]
-        
-        for padrao in padroes_nome:
-            match = re.search(padrao, texto, re.IGNORECASE if any(x in padrao for x in ['certifica', 'concluiu', 'participou', 'Nome', 'Aluno']) else 0)
-            if match:
-                nome_candidato = match.group(1).strip()
-                nome_lower = nome_candidato.lower()
-                
-                # Validações
-                palavras = nome_candidato.split()
-                
-                # Deve ter 2-6 palavras
-                if len(palavras) < 2 or len(palavras) > 6:
-                    continue
-                
-                # Não pode conter palavras excluídas
-                if any(palavra in nome_lower for palavra in palavras_excluir):
-                    continue
-                
-                # Não pode ter números
-                if any(char.isdigit() for char in nome_candidato):
-                    continue
-                
-                # Deve ter pelo menos 5 caracteres
-                if len(nome_candidato) < 5:
-                    continue
-                
-                info['nome'] = nome_candidato
-                break
-        
-        # ===== EXTRAÇÃO DE CURSO =====
-        padroes_curso = [
-            # 1. Udemy: entre "CERTIFICADO DE CONCLUSÃO" e "Instrutores"
-            r'CERTIFICADO\s+DE\s+CONCLUS[ÃA]O\s+(.+?)\s+(?:Instrutores|Data)',
-            
-            # 2. "Curso de/sobre" ou "Curso:"
-            r'[Cc]urso\s+(?:de|sobre|em)[:\s]+([^\n\r]{10,200}?)(?:\s+[Cc]arga|[Dd]ura[çc][ãa]o|[Dd]ata|$)',
-            r'[Cc]urso[:\s]+([^\n\r]{10,200}?)(?:\s+[Cc]arga|[Dd]ura[çc][ãa]o|[Dd]ata|$)',
-            
-            # 3. Workshop, Treinamento, Palestra
-            r'(?:[Ww]orkshop|[Tt]reinamento|[Pp]alestra|[Ss]emin[áa]rio)\s+(?:de|sobre|em)?[:\s]*([^\n\r]{10,150}?)(?:\s+[Cc]arga|[Dd]ura[çc][ãa]o|[Dd]ata|$)',
-            
-            # 4. "Certificado" + título longo (genérico)
-            r'[Cc]ertificado\s+(?:de)?\s*([^\n\r]{20,200}?)(?:\s+[Cc]arga|[Dd]ura[çc][ãa]o|[Dd]ata|[Aa]luno|[Nn]ome|$)',
-            
-            # 5. Entre "conclusão" e data/carga horária
-            r'conclus[ãa]o\s+(?:do|de)?\s*([^\n\r]{15,150}?)(?:\s+[Cc]arga|[Dd]ura[çc][ãa]o|[Dd]ata|$)',
-            
-            # 6. Título em MAIÚSCULAS (geralmente nome do curso)
-            r'\b([A-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑ][A-ZÁÀÂÃÉÈÊÍÏÓÔÕÖÚÇÑa-záàâãéèêíïóôõöúçñ\s]{20,150})\b(?=\s+[Cc]arga|\s+[Dd]ura[çc][ãa]o|\s+[Ii]nstrutor)',
-        ]
-        
-        for padrao in padroes_curso:
-            match = re.search(padrao, texto, re.MULTILINE)
-            if match:
-                curso = match.group(1).strip()
-                
-                # Limpeza
-                curso = re.sub(r'[_*\|•◦▪▫]+', '', curso)
-                curso = re.sub(r'\s+', ' ', curso)
-                curso = re.sub(r'^[:\-\s]+|[:\-\s]+$', '', curso)
-                
-                # Validações
-                # Tamanho mínimo e máximo
-                if len(curso) < 10 or len(curso) > 200:
-                    continue
-                
-                # Não pode ser só números
-                if curso.replace(' ', '').replace('.', '').isdigit():
-                    continue
-                
-                # Não pode ser um nome de pessoa (poucas palavras capitalizadas)
-                palavras = curso.split()
-                if len(palavras) <= 4 and all(p[0].isupper() and p[1:].islower() for p in palavras if p):
-                    continue
-                
-                # Remove sufixos comuns
-                curso = re.sub(r'\s+(?:online|presencial|ead|remoto|virtual)$', '', curso, flags=re.IGNORECASE)
-                
-                info['curso'] = curso
-                break
-        
-        # ===== EXTRAÇÃO DE DURAÇÃO =====
-        padroes_duracao = [
-            # Horas totais
-            r'(\d+)\s*(?:horas?|h)\s+(?:no\s+)?total',
-            r'Total[:\s]+(\d+)\s*(?:horas?|h)',
-            
-            # Carga horária
-            r'[Cc]arga\s+hor[áa]ria[:\s]+(\d+)\s*(?:horas?|h)',
-            r'Dura[çc][ãa]o[:\s]+(\d+)\s*(?:horas?|h)',
-            
-            # Horas simples
-            r'(\d+)\s*(?:horas?|h)(?:\s+aula|\s+de\s+(?:dura[çc][ãa]o|carga))?',
-            
-            # Horas e minutos
-            r'(\d+)\s*(?:horas?|h)\s*(?:e\s*)?(\d+)?\s*(?:minutos?|min)?',
-        ]
-        
-        for padrao in padroes_duracao:
-            match = re.search(padrao, texto, re.IGNORECASE)
-            if match:
-                horas = match.group(1)
-                # Valida que é um número razoável (1-999 horas)
-                if horas.isdigit() and 1 <= int(horas) <= 999:
-                    minutos = match.group(2) if len(match.groups()) > 1 else None
-                    if minutos and minutos.isdigit():
-                        info['duracao'] = f"{horas}h{minutos}min"
-                    else:
-                        info['duracao'] = f"{horas}h"
-                    break
-        
-        # ===== EXTRAÇÃO DE DATA =====
-        padroes_data = [
-            # Formato brasileiro: "27 de Maio de 2025"
-            r'(\d{1,2}\s+de\s+(?:janeiro|fevereiro|março|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\s+de\s+\d{4})',
-            
-            # Com "Data:"
-            r'Data[:\s]+(\d{1,2}\s+de\s+[A-Za-zçãõáéíóúâêôà]+\s+de\s+\d{4})',
-            r'Data[:\s]+(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{4})',
-            
-            # Formatos numéricos: DD/MM/YYYY ou DD-MM-YYYY
-            r'\b(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{4})\b',
-            
-            # Formato ISO: YYYY-MM-DD
-            r'\b(\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2})\b',
-            
-            # "em DD de MÊS de YYYY"
-            r'em\s+(\d{1,2}\s+de\s+[A-Za-zçãõáéíóúâêôà]+\s+de\s+\d{4})',
-        ]
-        
-        for padrao in padroes_data:
-            match = re.search(padrao, texto, re.IGNORECASE)
-            if match:
-                data = match.group(1).strip()
-                # Valida que tem pelo menos um dígito (ano)
-                if re.search(r'\d{4}', data):
-                    info['data'] = data
-                    break
-        
-        return info
+        return text
     
-    def obter_ano(self, data_str):
-        """Extrai ano da data"""
-        if not data_str:
-            return datetime.now().year
+    def _is_valid_name(self, name: str) -> bool:
+        """Valida se o texto parece ser um nome válido (tolerante)."""
+        if not name or len(name) < 5:
+            return False
         
-        # Busca por 4 dígitos seguidos (ano)
-        match = re.search(r'\d{4}', data_str)
+        # Palavras que NÃO devem aparecer em nomes
+        invalid_words = {
+            'curso', 'python', 'java', 'certificado', 'conclusão', 'instrutor',
+            'professor', 'completo', 'avançado', 'básico', 'data', 'duração',
+            'carga', 'horária', 'udemy', 'desenvolvimento', 'programação',
+            'sql', 'javascript', 'excel', 'access'
+        }
+        
+        words = name.lower().split()
+        
+        # Deve ter 2-5 palavras
+        if not (2 <= len(words) <= 5):
+            return False
+        
+        # Não pode conter muitos números
+        digit_count = sum(1 for c in name if c.isdigit())
+        if digit_count > 2:
+            return False
+        
+        # Não pode conter palavras inválidas
+        if any(invalid in name.lower() for invalid in invalid_words):
+            return False
+        
+        # Cada palavra deve ter pelo menos 2 caracteres (mais tolerante)
+        if any(len(word) < 2 for word in words):
+            return False
+        
+        return True
+    
+    def _extract_course(self, text: str) -> Optional[str]:
+        """
+        Extrai nome do curso procurando padrões comuns:
+        - "Curso de [COURSE]" 
+        - "[COURSE]: [descricao]"
+        
+        Args:
+            text: Texto normalizado
+            
+        Returns:
+            Nome do curso ou None
+        """
+        try:
+            # Padrão 1: "Curso de Python 3 do básico..."
+            match = re.search(r'[Cc]urso\s+de\s+([^\.]+?)(?:\s+(?:com|Instrutor|Instrutores|Número|Carga))', text, re.IGNORECASE)
+            if match:
+                course = self._clean_course(match.group(1))
+                if self._is_valid_course(course):
+                    self.logger.info(f"  🔍 Curso encontrado: {course}")
+                    return course
+            
+            # Padrão 2: "SQL: Vá do ZERO..." ou "[TECNOLOGIA]: [descricao]"
+            match = re.search(r'((?:Python|SQL|JavaScript|Java|C\+\+|PHP|Excel|Power\s+BI)[^\.]*?)(?:\s+(?:Instrutor|Instrutores|Completo|com|Data))', text, re.IGNORECASE)
+            if match:
+                course = self._clean_course(match.group(1))
+                if self._is_valid_course(course):
+                    self.logger.info(f"  🔍 Curso encontrado: {course}")
+                    return course
+            
+            self.logger.warning("  ⚠️  Curso não encontrado")
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"  ❌ Erro ao extrair curso: {e}")
+            return None
+    
+    def _clean_course(self, course_text: str) -> str:
+        """Limpa texto do curso removendo metadados."""
+        # Remove quebras de linha e normaliza espaços
+        course = re.sub(r'[\n\r]+', ' ', course_text)
+        course = re.sub(r'\s+', ' ', course)
+        
+        # Remove metadados de certificado
+        course = re.sub(r'\b(?:UC-[A-Za-z0-9\-]+|ude\.my/\S+|Udemy|certificado)\b', '', course, flags=re.IGNORECASE)
+        course = re.sub(r'Número\s+(?:de\s+)?(?:certificado|referência)[^\w]*', '', course, flags=re.IGNORECASE)
+        
+        # Remove tudo após "Instrutores"
+        course = re.split(r'\s+[Ii]nstrutor(?:es)?\b', course)[0]
+        
+        # Remove caracteres especiais
+        course = re.sub(r'[_*|•]+', '', course)
+        course = re.sub(r'^[:\-\s]+|[:\-\s]+$', '', course)
+        
+        return course.strip()
+    
+    def _is_valid_course(self, course: str) -> bool:
+        """Valida se o texto parece ser um curso válido (mais tolerante)."""
+        if not course:
+            return False
+        
+        # Aceitamais variações: 5-300 caracteres (era 10-200)
+        if len(course) < 5 or len(course) > 300:
+            return False
+        
+        # Não pode começar com palavras indesejadas
+        if re.match(r'^\s*(?:Instrutores|Professor|Data|Dura[çc][ãa]o|Carga|Número|De)\b', course, re.IGNORECASE):
+            return False
+        
+        # Deve conter pelo menos uma palavra com 5+ caracteres ou termo técnico
+        words = course.split()
+        has_long_word = any(len(word) >= 5 for word in words)
+        has_tech_term = any(term in course.lower() for term in [
+            'python', 'java', 'sql', 'javascript', 'excel', 'power', 'access',
+            'html', 'css', 'react', 'angular', 'node', 'django', 'flask'
+        ])
+        
+        return has_long_word or has_tech_term
+    
+    def _extract_duration(self, text: str) -> Optional[str]:
+        """
+        Extrai duração do curso.
+        
+        Args:
+            text: Texto normalizado
+            
+        Returns:
+            Duração em formato "XXh" ou None
+        """
+        patterns = [
+            r'(\d+)\s*(?:horas?|h)\s+(?:no\s+)?total',
+            r'[Cc]arga\s+hor[áa]ria\s*(?:de\s+)?(\d+)\s*h?',
+            r'[Dd]ura[çc][ãa]o:\s*(\d+)\s*h',
+            r'\b(\d{2,3})h\b',
+        ]
+        
+        for pattern in patterns:
+            try:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    hours = match.group(1)
+                    if hours.isdigit() and 1 <= int(hours) <= 999:
+                        duration = f"{hours}h"
+                        self.logger.info(f"  🔍 Duração encontrada: {duration}")
+                        return duration
+            except Exception as e:
+                self.logger.warning(f"Erro ao aplicar padrão de duração: {e}")
+                continue
+        
+        return None
+    
+    def _extract_date(self, text: str) -> Optional[str]:
+        """
+        Extrai data do certificado.
+        
+        Args:
+            text: Texto normalizado
+            
+        Returns:
+            Data formatada ou None
+        """
+        patterns = [
+            # DD de MÊS de YYYY
+            r'(\d{1,2}\s+de\s+(?:janeiro|fevereiro|mar[çc]o|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\s+de\s+\d{4})',
+            
+            # DD/MM/YYYY
+            r'\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})\b',
+            
+            # Data: formato
+            r'Data:\s*(\d{1,2}\s+de\s+[A-Za-zçãõáéíóú]+\s+de\s+\d{4})',
+        ]
+        
+        for pattern in patterns:
+            try:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    date = match.group(1).strip()
+                    if re.search(r'\d{4}', date):  # Valida presença de ano
+                        self.logger.info(f"  🔍 Data encontrada: {date}")
+                        return date
+            except Exception as e:
+                self.logger.warning(f"Erro ao aplicar padrão de data: {e}")
+                continue
+        
+        return None
+
+
+# ==============================================================================
+# CLASSE: CertificateProcessor
+# ==============================================================================
+
+class CertificateProcessor:
+    """
+    Orquestra o processamento completo de certificados PDF.
+    
+    Fluxo:
+    1. Extrai texto via OCR
+    2. Normaliza e extrai dados
+    3. Renomeia arquivo
+    4. Registra em CSV
+    5. Loga erros
+    """
+    
+    def __init__(self, output_folder: str):
+        """
+        Inicializa processador.
+        
+        Args:
+            output_folder: Pasta onde os PDFs estão localizados
+        """
+        self.output_folder = output_folder
+        self.logger = setup_logging(output_folder)
+        
+        # Inicializa componentes
+        self.logger.info("🚀 Inicializando componentes...")
+        self.ocr_extractor = OCRExtractor(languages=['pt', 'en'])
+        self.data_extractor = CertificateDataExtractor()
+        self.normalizer = TextNormalizer()
+        
+        # Armazena resultados
+        self.processed_data: List[Dict] = []
+        self.failed_files: List[Dict] = []
+        
+        self.logger.info("✅ Componentes inicializados\n")
+    
+    def process_single_pdf(self, pdf_path: str) -> bool:
+        """
+        Processa um único arquivo PDF.
+        
+        Args:
+            pdf_path: Caminho completo do PDF
+            
+        Returns:
+            True se processado com sucesso, False caso contrário
+        """
+        filename = os.path.basename(pdf_path)
+        self.logger.info(f"📄 Processando: {filename}")
+        
+        try:
+            # 1. Extrai texto via OCR
+            self.logger.info("  🔄 Extraindo texto...")
+            text = self.ocr_extractor.extract_from_pdf(pdf_path, dpi=400)
+            
+            if not text or len(text) < 20:
+                self.logger.warning(f"  ⚠️  Texto extraído muito curto ou vazio")
+                self.failed_files.append({
+                    'arquivo': filename,
+                    'motivo': 'Texto muito curto ou vazio',
+                    'timestamp': datetime.now().isoformat()
+                })
+                return False
+            
+            # 2. Extrai dados estruturados
+            self.logger.info("  🔍 Extraindo dados...")
+            data = self.data_extractor.extract_all(text)
+            
+            # 3. Valida dados mínimos
+            if not data.get('nome'):
+                self.logger.warning("  ⚠️  Nome não encontrado - marcando como incompleto")
+                data['nome'] = f"Aluno_Desconhecido_{int(time.time())}"
+            
+            if not data.get('curso'):
+                self.logger.warning("  ⚠️  Curso não encontrado - marcando como incompleto")
+                data['curso'] = "Curso Não Identificado"
+            
+            # 4. Renomeia arquivo
+            new_path = self._rename_file(pdf_path, data)
+            if new_path:
+                data['arquivo_original'] = filename
+                data['arquivo_novo'] = os.path.basename(new_path)
+            else:
+                data['arquivo_original'] = filename
+                data['arquivo_novo'] = filename
+            
+            # 5. Adiciona timestamp
+            data['processado_em'] = datetime.now().isoformat()
+            
+            # 6. Armazena resultado
+            self.processed_data.append(data)
+            
+            self.logger.info(f"  ✅ Processado com sucesso")
+            self.logger.info(f"     Nome: {data.get('nome', 'N/A')}")
+            self.logger.info(f"     Curso: {data.get('curso', 'N/A')}")
+            self.logger.info(f"     Duração: {data.get('duracao', 'N/A')}")
+            self.logger.info(f"     Data: {data.get('data', 'N/A')}")
+            self.logger.info(f"     Status: {data.get('status', 'N/A')}\n")
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"  ❌ Erro ao processar {filename}: {e}", exc_info=True)
+            self.failed_files.append({
+                'arquivo': filename,
+                'motivo': str(e),
+                'timestamp': datetime.now().isoformat()
+            })
+            return False
+    
+    def process_folder(self, folder_path: str) -> Tuple[int, int]:
+        """
+        Processa todos os PDFs em uma pasta.
+        
+        Args:
+            folder_path: Caminho da pasta com PDFs
+            
+        Returns:
+            Tupla (sucessos, falhas)
+        """
+        # Lista todos os PDFs
+        pdf_files = [f for f in os.listdir(folder_path) if f.lower().endswith('.pdf')]
+        
+        if not pdf_files:
+            self.logger.warning("❌ Nenhum arquivo PDF encontrado na pasta")
+            return 0, 0
+        
+        self.logger.info(f"📁 Encontrados {len(pdf_files)} arquivos PDF")
+        self.logger.info("=" * 70 + "\n")
+        
+        success_count = 0
+        fail_count = 0
+        
+        # Processa cada PDF
+        for idx, filename in enumerate(pdf_files, 1):
+            self.logger.info(f"[{idx}/{len(pdf_files)}] Iniciando processamento")
+            
+            pdf_path = os.path.join(folder_path, filename)
+            
+            if self.process_single_pdf(pdf_path):
+                success_count += 1
+            else:
+                fail_count += 1
+            
+            self.logger.info("-" * 70 + "\n")
+        
+        return success_count, fail_count
+    
+    def _rename_file(self, original_path: str, data: Dict) -> Optional[str]:
+        """
+        Renomeia arquivo baseado nos dados extraídos.
+        
+        Args:
+            original_path: Caminho original do arquivo
+            data: Dados extraídos
+            
+        Returns:
+            Novo caminho ou None se falhar
+        """
+        try:
+            folder = os.path.dirname(original_path)
+            
+            # Extrai componentes do nome
+            nome = self.normalizer.clean_for_filename(data.get('nome', 'Desconhecido'))
+            curso = self.normalizer.clean_for_filename(data.get('curso', 'Curso'), max_length=50)
+            
+            # Extrai ano da data
+            year = self._extract_year(data.get('data'))
+            
+            # Constrói novo nome
+            new_filename = f"{nome} - {curso} - {year}.pdf"
+            new_path = os.path.join(folder, new_filename)
+            
+            # Evita sobrescrever arquivos existentes
+            counter = 1
+            while os.path.exists(new_path):
+                new_filename = f"{nome} - {curso} - {year} ({counter}).pdf"
+                new_path = os.path.join(folder, new_filename)
+                counter += 1
+            
+            # Renomeia arquivo
+            os.rename(original_path, new_path)
+            self.logger.info(f"  ✅ Renomeado para: {new_filename}")
+            
+            return new_path
+            
+        except Exception as e:
+            self.logger.error(f"  ❌ Erro ao renomear arquivo: {e}")
+            return None
+    
+    def _extract_year(self, date_str: Optional[str]) -> str:
+        """
+        Extrai ano da string de data.
+        
+        Args:
+            date_str: String com data
+            
+        Returns:
+            Ano como string ou ano atual
+        """
+        if not date_str:
+            return str(datetime.now().year)
+        
+        # Procura por padrão de 4 dígitos (ano)
+        match = re.search(r'\d{4}', date_str)
         if match:
             return match.group(0)
         
-        # Busca por 2 dígitos no final (ano abreviado)
-        match = re.search(r'\d{2}$', data_str)
-        if match:
-            ano = int(match.group(0))
-            return f"20{ano}" if ano < 50 else f"19{ano}"
-        
-        return datetime.now().year
+        return str(datetime.now().year)
     
-    def limpar_nome_arquivo(self, texto):
-        """Remove caracteres inválidos para nome de arquivo"""
-        if not texto:
-            return "Desconhecido"
-        # Remove caracteres especiais
-        texto = re.sub(r'[<>:"/\\|?*]', '', texto)
-        # Limita tamanho
-        return texto[:100].strip()
+    def save_results(self):
+        """
+        Salva resultados em arquivos CSV.
+        """
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        # 1. Salva certificados processados com sucesso
+        if self.processed_data:
+            success_file = os.path.join(
+                self.output_folder, 
+                f'certificados_processados_{timestamp}.csv'
+            )
+            
+            try:
+                df_success = pd.DataFrame(self.processed_data)
+                df_success.to_csv(success_file, index=False, encoding='utf-8-sig')
+                self.logger.info(f"📊 Resultados salvos em: {success_file}")
+            except Exception as e:
+                self.logger.error(f"❌ Erro ao salvar CSV de sucesso: {e}")
+        
+        # 2. Salva log de arquivos com falha
+        if self.failed_files:
+            failed_file = os.path.join(
+                self.output_folder,
+                f'certificados_falhas_{timestamp}.csv'
+            )
+            
+            try:
+                df_failed = pd.DataFrame(self.failed_files)
+                df_failed.to_csv(failed_file, index=False, encoding='utf-8-sig')
+                self.logger.info(f"⚠️  Log de falhas salvo em: {failed_file}")
+            except Exception as e:
+                self.logger.error(f"❌ Erro ao salvar CSV de falhas: {e}")
     
-    def renomear_certificado(self, caminho_original, info):
-        """Renomeia o certificado baseado nas informações extraídas"""
-        if not all([info.get('nome'), info.get('curso')]):
-            print(f"  ⚠ Informações incompletas para renomear")
-            return None
+    def generate_report(self, success_count: int, fail_count: int):
+        """
+        Gera relatório final do processamento.
         
-        nome = self.limpar_nome_arquivo(info['nome'])
-        curso = self.limpar_nome_arquivo(info['curso'])
-        ano = self.obter_ano(info.get('data'))
+        Args:
+            success_count: Número de sucessos
+            fail_count: Número de falhas
+        """
+        total = success_count + fail_count
+        success_rate = (success_count / total * 100) if total > 0 else 0
         
-        # Cria novo nome
-        novo_nome = f"{nome} - {curso} - {ano}.pdf"
+        self.logger.info("\n" + "=" * 70)
+        self.logger.info("       RELATÓRIO FINAL")
+        self.logger.info("=" * 70)
+        self.logger.info(f"Total de arquivos: {total}")
+        self.logger.info(f"✅ Processados com sucesso: {success_count}")
+        self.logger.info(f"❌ Falhas: {fail_count}")
+        self.logger.info(f"📊 Taxa de sucesso: {success_rate:.1f}%")
         
-        # Caminho completo
-        pasta = os.path.dirname(caminho_original)
-        novo_caminho = os.path.join(pasta, novo_nome)
-        
-        # Renomeia (evita sobrescrever)
-        contador = 1
-        while os.path.exists(novo_caminho):
-            novo_nome = f"{nome} - {curso} - {ano} ({contador}).pdf"
-            novo_caminho = os.path.join(pasta, novo_nome)
-            contador += 1
-        
-        try:
-            os.rename(caminho_original, novo_caminho)
-            print(f"  ✓ Renomeado: {novo_nome}")
-            return novo_caminho
-        except Exception as e:
-            print(f"  ❌ Erro ao renomear: {e}")
-            return None
-    
-    def gerar_relatorio_csv(self, pasta_destino):
-        """Gera relatório CSV com informações dos certificados"""
-        if not self.certificados_processados:
-            return
-        
-        arquivo_csv = os.path.join(pasta_destino, f"relatorio_certificados_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
-        
-        try:
-            with open(arquivo_csv, 'w', newline='', encoding='utf-8-sig') as csvfile:
-                campos = ['Nome', 'Curso', 'Duração', 'Data', 'Arquivo']
-                writer = csv.DictWriter(csvfile, fieldnames=campos)
-                
-                writer.writeheader()
-                for cert in self.certificados_processados:
-                    writer.writerow({
-                        'Nome': cert.get('nome', ''),
-                        'Curso': cert.get('curso', ''),
-                        'Duração': cert.get('duracao', ''),
-                        'Data': cert.get('data', ''),
-                        'Arquivo': cert.get('arquivo', '')
-                    })
+        # Estatísticas adicionais
+        if self.processed_data:
+            complete_count = sum(1 for d in self.processed_data if d.get('status') == 'completo')
+            incomplete_count = len(self.processed_data) - complete_count
             
-            print(f"\n📊 Relatório gerado: {arquivo_csv}")
-            return arquivo_csv
-        except Exception as e:
-            print(f"❌ Erro ao gerar relatório: {e}")
-            return None
-    
-    def processar_certificados(self):
-        """Processa todos os certificados na pasta selecionada"""
-        pasta = self.selecionar_pasta()
+            self.logger.info(f"\n📋 Dados extraídos:")
+            self.logger.info(f"  Completos: {complete_count}")
+            self.logger.info(f"  Incompletos: {incomplete_count}")
         
-        if not pasta:
-            print("❌ Nenhuma pasta selecionada.")
-            return
-        
-        # Garante que dados de português estão instalados
-        print("\n🔍 Verificando dados de OCR...")
-        self.garantir_dados_portugues()
-        
-        print(f"\n📁 Processando certificados em: {pasta}\n")
-        
-        # Busca arquivos PDF
-        arquivos_pdf = [f for f in os.listdir(pasta) if f.lower().endswith('.pdf')]
-        
-        if not arquivos_pdf:
-            print("❌ Nenhum arquivo PDF encontrado na pasta.")
-            return
-        
-        print(f"📄 Encontrados {len(arquivos_pdf)} arquivos PDF\n")
-        print("=" * 70)
-        
-        for idx, arquivo in enumerate(arquivos_pdf, 1):
-            caminho_completo = os.path.join(pasta, arquivo)
-            print(f"\n[{idx}/{len(arquivos_pdf)}] {arquivo}")
-            
-            # Extrai texto
-            texto = self.extrair_texto_pdf(caminho_completo)
-            
-            if not texto:
-                print(f"  ⚠ Não foi possível extrair texto")
-                continue
-            
-            # Extrai informações
-            info = self.extrair_informacoes(texto)
-            
-            if not info or not info.get('nome'):
-                print(f"  ⚠ Não foi possível extrair informações")
-                continue
-            
-            print(f"  ✓ Nome: {info.get('nome')}")
-            print(f"  ✓ Curso: {info.get('curso')}")
-            print(f"  ✓ Duração: {info.get('duracao')}")
-            print(f"  ✓ Data: {info.get('data')}")
-            
-            # Renomeia arquivo
-            novo_caminho = self.renomear_certificado(caminho_completo, info)
-            
-            if novo_caminho:
-                info['arquivo'] = os.path.basename(novo_caminho)
-                self.certificados_processados.append(info)
-        
-        print("\n" + "=" * 70)
-        
-        # Gera relatório
-        if self.certificados_processados:
-            self.gerar_relatorio_csv(pasta)
-            print(f"\n✅ Processados {len(self.certificados_processados)} de {len(arquivos_pdf)} certificados!")
-        else:
-            print("\n⚠ Nenhum certificado foi processado com sucesso.")
+        self.logger.info("=" * 70 + "\n")
 
 
-# ============================================================================
-# FUNÇÃO PRINCIPAL
-# ============================================================================
+# ==============================================================================
+# FUNÇÃO: select_folder
+# ==============================================================================
+
+def select_folder() -> Optional[str]:
+    """
+    Abre diálogo para seleção de pasta.
+    
+    Returns:
+        Caminho da pasta selecionada ou None
+    """
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    folder = filedialog.askdirectory(title="Selecione a pasta com certificados PDF")
+    root.destroy()
+    return folder
+
+
+# ==============================================================================
+# FUNÇÃO PRINCIPAL: main
+# ==============================================================================
 
 def main():
+    """
+    Função principal do programa.
+    """
     print("=" * 70)
-    print("         GERENCIADOR DE CERTIFICADOS - Versão Completa")
-    print("=" * 70)
-    print("\n🔍 Iniciando verificação do sistema...")
-    
-    # Verifica e instala dependências
-    if not verificar_e_instalar_dependencias():
-        print("\n❌ Não foi possível configurar todas as dependências")
-        print("   O programa pode não funcionar corretamente")
-        print()
-        resposta = input("Deseja continuar mesmo assim? (S/N): ")
-        if resposta.lower() not in ['s', 'sim', 'y', 'yes']:
-            return
-    
-    print("\n" + "=" * 70)
-    print("         PROCESSAMENTO DE CERTIFICADOS")
+    print("       GERENCIADOR DE CERTIFICADOS v3.0")
+    print("       Powered by EasyOCR")
     print("=" * 70)
     print("\n📋 Este programa irá:")
-    print("  1. Ler certificados PDF (com OCR se necessário)")
-    print("  2. Extrair: Nome, Curso, Duração e Data")
-    print("  3. Renomear: Nome - Curso - Ano.pdf")
-    print("  4. Gerar relatório CSV com todas as informações")
-    print()
+    print("  1. Extrair texto dos PDFs usando EasyOCR avançado")
+    print("  2. Aplicar pré-processamento de imagem para melhor OCR")
+    print("  3. Identificar: Nome, Curso, Duração e Data")
+    print("  4. Renomear: Nome - Curso - Ano.pdf")
+    print("  5. Gerar relatórios CSV (sucessos e falhas)")
+    print("  6. Criar log detalhado de processamento")
+    print("\n⚠️  IMPORTANTE:")
+    print("  - Primeira execução pode demorar (download de modelos EasyOCR)")
+    print("  - PDFs de baixa qualidade podem ter extração incompleta")
+    print("  - Arquivos com falha serão registrados em CSV separado")
     
-    input("Pressione ENTER para selecionar a pasta com os certificados...")
+    input("\n\nPressione ENTER para começar...")
     
-    # Executa processamento
-    gerenciador = GerenciadorCertificados()
-    gerenciador.processar_certificados()
+    # Seleciona pasta
+    print("\n📁 Selecione a pasta com os certificados...")
+    folder = select_folder()
+    
+    if not folder:
+        print("❌ Nenhuma pasta selecionada. Encerrando.")
+        return
+    
+    print(f"\n✅ Pasta selecionada: {folder}\n")
+    
+    try:
+        # Inicializa processador
+        processor = CertificateProcessor(folder)
+        
+        # Processa todos os PDFs
+        start_time = time.time()
+        success_count, fail_count = processor.process_folder(folder)
+        elapsed_time = time.time() - start_time
+        
+        # Salva resultados
+        processor.save_results()
+        
+        # Gera relatório
+        processor.generate_report(success_count, fail_count)
+        
+        print(f"\n⏱️  Tempo total: {elapsed_time:.2f} segundos")
+        print(f"⚡ Média: {elapsed_time/(success_count + fail_count):.2f}s por arquivo\n")
+        
+    except Exception as e:
+        print(f"\n❌ Erro crítico: {e}")
+        logging.error(f"Erro crítico na execução: {e}", exc_info=True)
     
     print("\n" + "=" * 70)
-    print("         PROCESSO CONCLUÍDO!")
+    print("       PROCESSAMENTO CONCLUÍDO!")
     print("=" * 70)
     input("\nPressione ENTER para sair...")
 
+
+# ==============================================================================
+# PONTO DE ENTRADA
+# ==============================================================================
 
 if __name__ == "__main__":
     main()

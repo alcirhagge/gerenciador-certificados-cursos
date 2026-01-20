@@ -1,4 +1,30 @@
-PyPDF2==3.0.1
-pdf2image==1.17.0
-pytesseract==0.3.10
-Pillow==10.2.0
+# Gerenciador de Certificados v3.0 - Dependências
+# Instalação: pip install -r requirements.txt
+
+# ====== OCR e Processamento de Imagem ======
+# EasyOCR - Reconhecimento Ótico de Caracteres (substitui Tesseract)
+easyocr>=1.7.0
+
+# OpenCV - Processamento avançado de imagem (pré-processamento para OCR)
+opencv-python>=4.8.0
+
+# Pillow - Manipulação de imagens
+Pillow>=10.4.0
+
+# NumPy - Operações numéricas e arrays (versão fixada para compatibilidade com PyInstaller)
+numpy<2.0.0
+
+# ====== Manipulação de PDF ======
+# Conversão de PDF para imagem
+pdf2image>=1.17.0
+
+# ====== Análise de Dados ======
+# Pandas - Manipulação de dados e geração de CSV
+pandas>=2.0.0
+
+# ====== Observações ======
+# - EasyOCR fará download automático de modelos na primeira execução (~100-500MB)
+# - OpenCV é essencial para pré-processamento de imagem
+# - Pandas facilita geração de CSVs robustos
+# - Não é mais necessário instalar Tesseract manualmente
+
